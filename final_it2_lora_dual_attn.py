@@ -436,7 +436,7 @@ class MultimodalIndicTrans2(nn.Module):
         self.custom_decoder = CustomDecoder(self.original_decoder, fusion_dim)
         
         # Add adapters
-        #self._add_adapters_to_decoder(adapter_type, lora_rank, lora_alpha, adapter_size)
+        self._add_adapters_to_decoder(adapter_type, lora_rank, lora_alpha, adapter_size)
 
     def _add_adapters_to_decoder(self, adapter_type, lora_rank, lora_alpha, adapter_size):
         if adapter_type == "lora":
