@@ -868,13 +868,13 @@ for ep in tqdm(range(num_epochs)):
         #save_path = "multimodal_indictrans2_best_lora_r_16_a_32_mod_dual_attn.pth"
         save_path = "multimodal_indictrans2_best_dual_attn.pth"
         torch.save(model.state_dict(), save_path)
-        print(f"✅ Saved best model to {save_path}.")
+        print(f"Saved best model to {save_path}.")
     else:
         epochs_no_improve += 1
-        print(f"⚠️ No improvement for {epochs_no_improve} epoch(s).")
+        print(f"No improvement for {epochs_no_improve} epoch(s).")
 
     if epochs_no_improve >= patience:
-        print(f"⏹ Early stopping triggered after {ep+1} epochs.")
+        print(f"Early stopping triggered after {ep+1} epochs.")
         break
 
 
@@ -887,9 +887,9 @@ def translate_test_set(model_path, output_path="output_test.hi", test_loader=tes
     # Load best model weights
     try:
         model.load_state_dict(torch.load(model_path, map_location=device))
-        print(f"✅ Loaded model from {model_path}")
+        print(f"Loaded model from {model_path}")
     except Exception as e:
-        print(f"❌ Failed to load model: {e}")
+        print(f"Failed to load model: {e}")
         print("Aborting inference.")
         return
 
@@ -931,7 +931,7 @@ def translate_test_set(model_path, output_path="output_test.hi", test_loader=tes
                         print(f"Sample translation: {decoded[0][:100]}...", flush=True)
 
             except Exception as e:
-                print(f"❌ Failed to process batch {batch_idx}: {e}", flush=True)
+                print(f"Failed to process batch {batch_idx}: {e}", flush=True)
                 failed_batches += 1
                 # Add empty translations for failed batches to maintain alignment
                 batch_size = batch['src_input_ids'].size(0)
@@ -944,12 +944,12 @@ def translate_test_set(model_path, output_path="output_test.hi", test_loader=tes
             for line in outputs_list:
                 f.write(line.strip() + '\n')
         
-        print(f"✅ Saved {len(outputs_list)} translations to {output_path}")
+        print(f"Saved {len(outputs_list)} translations to {output_path}")
         if failed_batches > 0:
-            print(f"⚠️  {failed_batches} batches failed during generation")
+            print(f"{failed_batches} batches failed during generation")
             
     except Exception as e:
-        print(f"❌ Failed to save outputs: {e}")
+        print(f"Failed to save outputs: {e}")
 
     # Save outputs
     with open(output_path, 'w', encoding='utf-8') as f:
