@@ -8,6 +8,8 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from transformers.modeling_outputs import BaseModelOutput
 from tqdm import tqdm
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+
 from transformers import GenerationConfig
 import copy
 
@@ -168,8 +170,8 @@ class DualCrossAttentionLayer(nn.Module):
         # New cross attention for images
         # self.img_cross_attn = copy.deepcopy(original_layer.encoder_attn)
         # self.img_attn_layer_norm = copy.deepcopy(original_layer.encoder_attn_layer_norm)
-        num_heads = self.text_cross_attn.num_heads
-        dropout = self.text_cross_attn.dropout
+        # num_heads = self.text_cross_attn.num_heads
+        # dropout = self.text_cross_attn.dropout
         # self.img_cross_attn = nn.MultiheadAttention(
         #     embed_dim=hidden_size,
         #     num_heads=num_heads,
@@ -178,14 +180,20 @@ class DualCrossAttentionLayer(nn.Module):
         # )
 
         self.img_cross_attn = copy.deepcopy(original_layer.encoder_attn)
+
         # re-init only key & value projections
         nn.init.xavier_uniform_(self.img_cross_attn.k_proj.weight)
         nn.init.xavier_uniform_(self.img_cross_attn.v_proj.weight)
+        for p in self.text_cross_attn.parameters():
+            p.requires_grad = True
+
+        for p in self.img_cross_attn.parameters():
+            p.requires_grad = True
         self.img_attn_layer_norm = nn.LayerNorm(hidden_size)
         
         # Fusion layer to combine image and text cross-attention outputs
-        self.fusion_layer = nn.Linear(2*hidden_size, hidden_size)
-        self.fusion_layer_norm = nn.LayerNorm(hidden_size)
+        # self.fusion_layer = nn.Linear(2*hidden_size, hidden_size)
+        # self.fusion_layer_norm = nn.LayerNorm(hidden_size)
     
     def _expand_mask(self, mask, dtype, tgt_len=None):
         """
@@ -289,10 +297,10 @@ class DualCrossAttentionLayer(nn.Module):
         # Combine cross-attention outputs
         if text_cross_attn_output is not None and img_cross_attn_output is not None:
             # Concatenate and fuse
-            combined = torch.cat([text_cross_attn_output, img_cross_attn_output], dim=-1)
-            fused_output = self.fusion_layer(combined)
-            fused_output = self.fusion_layer_norm(fused_output)
-            hidden_states = residual + fused_output
+            # combined = torch.cat([text_cross_attn_output, img_cross_attn_output], dim=-1)
+            # fused_output = self.fusion_layer(combined)
+            # fused_output = self.fusion_layer_norm(fused_output)
+            hidden_states = residual + text_cross_attn_output + img_cross_attn_output
         elif text_cross_attn_output is not None:
             hidden_states = residual + text_cross_attn_output
         elif img_cross_attn_output is not None:
@@ -434,6 +442,7 @@ class MultimodalIndicTrans2(nn.Module):
         # Replace decoder with custom dual cross-attention decoder
         self.original_decoder = self.nmt_model.model.decoder
         self.custom_decoder = CustomDecoder(self.original_decoder, fusion_dim)
+        self.nmt_model.model.decoder = self.custom_decoder
         
         # Add adapters
         self._add_adapters_to_decoder(adapter_type, lora_rank, lora_alpha, adapter_size)
@@ -555,121 +564,134 @@ class MultimodalIndicTrans2(nn.Module):
     
     def generate(self, input_ids, attention_mask, image_features, img_attention_mask, **generation_kwargs):
         """
-        Custom generation method that handles dual cross-attention
+        Custom beam search generation with dual cross-attention (text + image).
         """
-        # Prepare encoder features
-        # text_embeds, img_encoded = self._prepare_encoder_outputs(
-        #     input_ids, attention_mask, image_features, img_attention_mask
-        # )
+
+        # ==== Encode text ====
         encoder_outputs = self.nmt_model.get_encoder()(
-            input_ids=input_ids, 
+            input_ids=input_ids,
             attention_mask=attention_mask,
             output_attentions=False,
             output_hidden_states=False
         )
-        text_embeds = encoder_outputs.last_hidden_state  # (B, L, fusion_dim)
+        text_embeds = encoder_outputs.last_hidden_state  # (B, L, d_model)
 
-        # Encode image
-        img_proj = self.img_proj(image_features)         # (B, V, fusion_dim)
+        # ==== Encode image ====
+        img_proj = self.img_proj(image_features)          # (B, V, d_model)
         img_key_padding_mask = (img_attention_mask == 0)
         img_encoded = self.img_encoder(img_proj, src_key_padding_mask=img_key_padding_mask)
-        img_encoded = self.img_layernorm(img_encoded)    # (B, V, fusion_dim)
-        
-        # Store features for decoder access during generation
-        self._stored_text_features = text_embeds
-        self._stored_text_mask = attention_mask
-        self._stored_img_features = img_encoded
-        self._stored_img_mask = img_attention_mask
-        
-        # Get generation parameters
-        max_length = generation_kwargs.get('max_length', 128)
-        max_new_tokens = generation_kwargs.get('max_new_tokens', None)
-        num_beams = generation_kwargs.get('num_beams', 1)
-        do_sample = generation_kwargs.get('do_sample', False)
-        temperature = generation_kwargs.get('temperature', 1.0)
-        pad_token_id = generation_kwargs.get('pad_token_id', self.nmt_model.config.pad_token_id)
-        eos_token_id = generation_kwargs.get('eos_token_id', self.nmt_model.config.eos_token_id)
-        bos_token_id = generation_kwargs.get('bos_token_id', self.nmt_model.config.bos_token_id)
-        
+        img_encoded = self.img_layernorm(img_encoded)     # (B, V, d_model)
+
+        # Params
+        max_length = generation_kwargs.get("max_length", 128)
+        max_new_tokens = generation_kwargs.get("max_new_tokens", None)
+        num_beams = generation_kwargs.get("num_beams", 1)
+        do_sample = generation_kwargs.get("do_sample", False)
+        temperature = generation_kwargs.get("temperature", 1.0)
+        pad_token_id = generation_kwargs.get("pad_token_id", self.nmt_model.config.pad_token_id)
+        eos_token_id = generation_kwargs.get("eos_token_id", self.nmt_model.config.eos_token_id)
+        bos_token_id = generation_kwargs.get("bos_token_id", self.nmt_model.config.bos_token_id)
+
         batch_size = input_ids.size(0)
         device = input_ids.device
-        
-        if max_new_tokens is not None:
-            max_length = max_new_tokens + 1  # +1 for BOS token
-        
-        # Initialize with BOS token
-        if bos_token_id is None:
-            bos_token_id = pad_token_id
-            
+        vocab_size = self.nmt_model.config.vocab_size
+        # ==== Expand encoder states for beams ====
+        text_embeds = text_embeds.repeat_interleave(num_beams, dim=0)
+        attention_mask = attention_mask.repeat_interleave(num_beams, dim=0)
+        img_encoded = img_encoded.repeat_interleave(num_beams, dim=0)
+        img_attention_mask = img_attention_mask.repeat_interleave(num_beams, dim=0)
+
+        # ==== Init sequences ====
         generated_ids = torch.full(
-            (batch_size, 1), 
-            bos_token_id, 
-            dtype=torch.long, 
-            device=device
+            (batch_size * num_beams, max_length),
+            pad_token_id,
+            dtype=torch.long,
+            device=device,
         )
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        # Generation loop
-        for step in range(max_length - 1):
-            # Get decoder outputs
+        generated_ids[:, 0] = bos_token_id
+        seq_lengths = torch.ones(batch_size * num_beams, dtype=torch.long, device=device)
+
+        beam_scores = torch.zeros((batch_size, num_beams), device=device)
+        beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view(-1)  # flatten
+
+        finished = torch.zeros(batch_size * num_beams, dtype=torch.bool, device=device)
+
+        # ==== Beam search loop ====
+        past_key_values = None
+        for step in range(1, max_length):
+            # Current input
+            current_ids = generated_ids[:, :step]
+
+            # Decode step
             decoder_outputs = self.custom_decoder(
-                input_ids=generated_ids,
+                input_ids=current_ids,
+                attention_mask=None,  # decoder will handle causal mask internally
                 encoder_hidden_states=text_embeds,
                 encoder_attention_mask=attention_mask,
                 img_hidden_states=img_encoded,
                 img_attention_mask=img_attention_mask,
+                use_cache=False,
             )
-            
-            # Get logits for next token
-            logits = self.nmt_model.lm_head(decoder_outputs.last_hidden_state)
-            next_token_logits = logits[:, -1, :]  # (batch_size, vocab_size)
-            
-            # Apply temperature
-            if temperature != 1.0:
-                next_token_logits = next_token_logits / temperature
-            
-            # Sample or select next token
+
+            logits = self.nmt_model.lm_head(decoder_outputs.last_hidden_state)  # (B*num_beams, step, V)
+            next_token_logits = logits[:, -1, :]  # (B*num_beams, V)
+
+            # Sampling vs greedy
             if do_sample:
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1)  # (B, 1)
+                probs = F.softmax(next_token_logits / temperature, dim=-1)
+                log_probs = torch.log(probs + 1e-12)
             else:
-                next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)  # (B, 1)
+                log_probs = F.log_softmax(next_token_logits, dim=-1)
 
-            # If already finished, force pad tokens
-            next_tokens = next_tokens.squeeze(-1)   # (B,)
-            pad_tokens = torch.full_like(next_tokens, pad_token_id)  # (B,)
-            next_tokens = torch.where(finished, pad_tokens, next_tokens)  # (B,)
-            
-            # Check for EOS token (simple stopping criterion)
-            if eos_token_id is not None:
-                finished |= (next_tokens == eos_token_id)
-            next_tokens = next_tokens.unsqueeze(-1)  # (B, 1)
+            # Add beam scores
+            next_scores = log_probs + beam_scores[:, None]
+            next_scores = next_scores.view(batch_size, num_beams * vocab_size)
 
-            # Append next token
-            generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
+            # Select top beams
+            next_scores, next_tokens = torch.topk(next_scores, k=num_beams, dim=1)
+            next_indices = next_tokens // vocab_size
+            next_tokens = next_tokens % vocab_size
 
-            # If all sequences finished → stop early
-            if finished.all():
+            # Reorder
+            beam_idx = (
+                torch.arange(batch_size, device=device)[:, None] * num_beams + next_indices
+            ).view(-1)
+
+            generated_ids = generated_ids[beam_idx]
+            seq_lengths = seq_lengths[beam_idx]
+            finished = finished[beam_idx]
+
+            # Append token
+            generated_ids[:, step] = next_tokens.view(-1)
+            seq_lengths += (~finished).long()
+            beam_scores = next_scores.view(-1)
+
+            # Mark finished
+            eos_in_batch = next_tokens.view(-1) == eos_token_id
+            finished |= eos_in_batch
+
+            # Mask finished beams so they don't compete further
+            beam_scores = beam_scores.masked_fill(finished, -1e9)
+
+            # Early stop if all beams finished
+            if finished.view(batch_size, num_beams).all(dim=1).all():
                 break
-        
-        return generated_ids
 
-    def prepare_inputs_for_generation(self, input_ids, **kwargs):
-        """
-        Prepare inputs for generation step
-        """
-        # This method is called by the transformers generate method
-        # We need to handle our custom inputs here
-        return {
-            "input_ids": input_ids,
-            "encoder_hidden_states": self._stored_text_features,
-            "encoder_attention_mask": self._stored_text_mask,
-            "img_hidden_states": self._stored_img_features,
-            "img_attention_mask": self._stored_img_mask,
-        }
+        # ==== Select best beam ====
+        beam_scores = beam_scores.view(batch_size, num_beams)
+        seq_lengths = seq_lengths.view(batch_size, num_beams)
 
-    def _reorder_cache(self, past_key_values, beam_idx):
-        """Required for beam search"""
-        return past_key_values
+        # Apply length penalty
+        # length_penalty = seq_lengths.float().pow(length_penalty)
+        # norm_scores = beam_scores / length_penalty
+
+        best = beam_scores.argmax(dim=1)
+        best_sequences = generated_ids.view(batch_size, num_beams, -1)[
+            torch.arange(batch_size, device=device), best
+        ]
+
+        return best_sequences
 
     def get_encoder(self):
         """Return encoder for compatibility"""
@@ -768,8 +790,10 @@ model = MultimodalIndicTrans2(nmt_model_name="/home/cfiltlab/24m0741/indic_sampl
         lora_rank=16,
         lora_alpha=32)
 
-# model_path = "multimodal_indictrans2_best_lora_r_16_a_32_mod_full_img.pth"
+model_path = "multimodal_indictrans2_best_lora_r_16_a_32_mod_dual_attn.pth"
+print("Model:", model)
 # model.load_state_dict(torch.load(model_path))
+
 model.to(device)
 print("model loaded")
 total_params = sum(p.numel() for p in model.parameters())
@@ -829,7 +853,7 @@ def validate():
 # ----- Run Training -----
 
 num_epochs = 50
-patience = 7   # stop if no improvement for 3 epochs
+patience = 11   # stop if no improvement for 3 epochs
 best_val_loss = float('inf')
 epochs_no_improve = 0
 
@@ -866,6 +890,7 @@ def translate_test_set(model_path, output_path="output_test.hi", test_loader=tes
         print(f"✅ Loaded model from {model_path}")
     except Exception as e:
         print(f"❌ Failed to load model: {e}")
+        print("Aborting inference.")
         return
 
     model.eval()
@@ -887,8 +912,9 @@ def translate_test_set(model_path, output_path="output_test.hi", test_loader=tes
                     image_features=image_feats,
                     img_attention_mask=img_attention_mask,
                     max_length=128,
-                    num_beams=5,  # <--- INCREASE THIS! A value between 4 and 8 is common.
-                    do_sample=False, # Keep this false when using beam search
+                    num_beams=2,  
+                    do_sample=False,
+                    temperature=0.9,
                     pad_token_id=tokenizer_tgt.pad_token_id,
                     eos_token_id=tokenizer_tgt.eos_token_id,
                     bos_token_id=tokenizer_tgt.bos_token_id
@@ -899,13 +925,13 @@ def translate_test_set(model_path, output_path="output_test.hi", test_loader=tes
                 outputs_list.extend(decoded)
                 
                 # Progress logging
-                if batch_idx % 10 == 0:
-                    print(f"Processed batch {batch_idx}/{len(test_loader)}")
+                if batch_idx % 1 == 0:
+                    print(f"Processed batch {batch_idx}/{len(test_loader)}", flush=True)
                     if decoded:
-                        print(f"Sample translation: {decoded[0][:100]}...")
+                        print(f"Sample translation: {decoded[0][:100]}...", flush=True)
 
             except Exception as e:
-                print(f"❌ Failed to process batch {batch_idx}: {e}")
+                print(f"❌ Failed to process batch {batch_idx}: {e}", flush=True)
                 failed_batches += 1
                 # Add empty translations for failed batches to maintain alignment
                 batch_size = batch['src_input_ids'].size(0)
@@ -932,6 +958,7 @@ def translate_test_set(model_path, output_path="output_test.hi", test_loader=tes
 
     print(f"Saved {len(outputs_list)} translations to {output_path}")
 
+print("Starting test-time inference...")
 # ----- Run Test-Time Inference -----
 translate_test_set("multimodal_indictrans2_best_dual_attn.pth", output_path="output_test_dual_attn.hi")
 # ----- Run Ambiguous Test-Time Inference -----
